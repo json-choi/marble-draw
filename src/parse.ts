@@ -50,10 +50,15 @@ export function parseRoster(text: string): Roster {
 }
 
 // Spread hues with the golden angle so neighbours in the list never look alike.
-export function paletteColor(k: number): { hue: number; css: string } {
+// Computed once: the minimap and the HUD ask for these colors every frame.
+const PALETTE = Array.from({ length: PALETTE_SIZE }, (_, k) => {
   const hue = (k * 137.508 + 8) % 360;
   const light = k % 3 === 0 ? 62 : k % 3 === 1 ? 55 : 68;
   return { hue, css: `hsl(${hue.toFixed(1)} 88% ${light}%)` };
+});
+
+export function paletteColor(k: number): { hue: number; css: string } {
+  return PALETTE[k % PALETTE_SIZE];
 }
 
 export function shortLabel(name: string): string {

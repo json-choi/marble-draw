@@ -1,5 +1,5 @@
 import { World, DT, GATE_T, Ev } from "./physics";
-import { buildMap, ballRadius, type MapData, type MapId, type MapLength } from "./map";
+import { buildMap, ballRadius, MAPS, type MapData, type MapId, type MapLength } from "./map";
 import { mulberry32, permutation } from "./rng";
 import { paletteColor, shortLabel, PALETTE_SIZE, type Roster } from "./parse";
 import { Sound } from "./audio";
@@ -18,6 +18,18 @@ type Callbacks = { onHud: (h: Hud) => void; onWinner: (w: Winner) => void; onDon
 
 const MAX_PARTICLES = 2400;
 const MINIMAP_W = 46;
+const FONT = '"Pretendard Variable", Pretendard, system-ui, sans-serif';
+const BG = "#0a0c13";
+const ACCENT = "#f2c14e";
+// spark colors are bucketed so hundreds of sparks become a few dozen strokes
+const SPARK_HUES = 24, SPARK_ALPHAS = 4, SPARK_KEYS = SPARK_HUES * SPARK_ALPHAS;
+const SPARK_STYLE = Array.from({ length: SPARK_KEYS }, (_, k) => {
+  const h = (Math.floor(k / SPARK_ALPHAS) + 0.5) * (360 / SPARK_HUES), a = ((k % SPARK_ALPHAS) + 0.5) / SPARK_ALPHAS;
+  return `hsla(${h.toFixed(0)} 70% 70% / ${a.toFixed(2)})`;
+});
+const CONFETTI_STYLE = Array.from({ length: 12 }, (_, k) => `hsl(${k * 30} 82% 62%)`);
+const STAR_STYLE = ["rgba(200,212,235,0.22)", "rgba(200,212,235,0.34)", "rgba(220,228,245,0.5)"];
+const STAR_Z = [0.14, 0.3, 0.5];
 
 export class Engine {
   readonly sound = new Sound();
@@ -55,7 +67,22 @@ export class Engine {
   // visuals
   private sprites: HTMLCanvasElement[] = [];
   private glows = new Map<number, HTMLCanvasElement>();
-  private stars: { x: number; y: number; z: number; s: number }[] = [];
+  private bumperSprites = new Map<number, HTMLCanvasElement>();
+  private stars: { x: number; y: number; s: number }[][] = [[], [], []];
+  // balls with their names baked in, so 1000 labels cost 1000 image copies instead of 2000 text draws
+  private atlas: HTMLCanvasElement | null = null;
+  private atlasKey = "";
+  private atlasCell = 0; private atlasCols = 1;
+  private atlasSlot = new Int32Array(0);
+  private byColor: Int32Array[] = [];
+  private styles = new Map<number, string>();
+  private secStyle: { band: string; name: string; mini: string }[] = [];
+  // the course is one material, faintly tinted per course; the color belongs to the marbles
+  private tint = 210;
+  private sparkCount = new Int32Array(SPARK_KEYS + 1);
+  private sparkOrder = new Int32Array(MAX_PARTICLES);
+  private vignette: CanvasGradient | null = null;
+  private drawSig = "";
   private trails = new Map<number, number[]>();
   private px = new Float32Array(MAX_PARTICLES); private py = new Float32Array(MAX_PARTICLES);
   private pvx = new Float32Array(MAX_PARTICLES); private pvy = new Float32Array(MAX_PARTICLES);
@@ -80,7 +107,8 @@ export class Engine {
     this.ctx = canvas.getContext("2d", { alpha: false })!;
     this.cb = cb;
     const rnd = mulberry32(42);
-    for (let k = 0; k < 220; k++) this.stars.push({ x: rnd(), y: rnd(), z: 0.1 + rnd() * 0.5, s: 0.5 + rnd() * 1.6 });
+    for (let k = 0; k < 180; k++) this.stars[k % 3].push({ x: rnd(), y: rnd(), s: 0.6 + rnd() * 1.4 });
+    this.makeSprites();
     this.ro = new ResizeObserver(() => this.resize());
     this.ro.observe(canvas);
     this.resize();
@@ -110,6 +138,9 @@ export class Engine {
     this.ch = Math.max(1, r.height);
     this.canvas.width = Math.round(this.cw * this.dpr);
     this.canvas.height = Math.round(this.ch * this.dpr);
+    this.vignette = null;
+    this.drawSig = "";
+    if (this.opts && this.map) this.buildAtlas();
   }
 
   // ---------- setup ----------
@@ -129,8 +160,10 @@ export class Engine {
     }
     this.R = ballRadius(n);
     this.map = buildMap(o.mapId, o.length, n, this.R);
-    this.makeSprites();
+    this.prepMap();
+    this.buildAtlas();
     this.phase = "preview";
+    this.drawSig = "";
     const slots = permutation(n, mulberry32(o.seed));
     if (keepSlots && this.slotOf.length === n) {
       this.slotOf = slots;
@@ -158,6 +191,7 @@ export class Engine {
     this.opts = { ...this.opts, seed };
     this.slotOf = permutation(n, mulberry32(seed));
     this.shuffleT = 0;
+    this.drawSig = "";
     this.sound.ensure();
     this.sound.whoosh();
   }
@@ -191,6 +225,7 @@ export class Engine {
     if (this.sound.musicOn) this.sound.startMusic();
     // a fresh board every run, so a replay with the same seed is the same race
     this.map = buildMap(o.mapId, o.length, this.slotOf.length, this.R);
+    this.prepMap();
     this.world = new World(this.map, this.R, o.seed, o.events, this.slotOf);
     this.phase = "countdown";
     this.winners = [];
@@ -269,7 +304,6 @@ export class Engine {
   // ---------- sprites ----------
   private makeSprites() {
     const size = 64;
-    this.sprites = [];
     for (let k = 0; k < PALETTE_SIZE; k++) {
       const { hue } = paletteColor(k);
       const c = document.createElement("canvas");
@@ -278,18 +312,98 @@ export class Engine {
       const r = size / 2 - 1;
       const grad = g.createRadialGradient(size * 0.36, size * 0.32, r * 0.08, size / 2, size / 2, r);
       grad.addColorStop(0, `hsl(${hue} 100% 92%)`);
-      grad.addColorStop(0.28, `hsl(${hue} 92% 66%)`);
-      grad.addColorStop(0.8, `hsl(${hue} 85% 42%)`);
-      grad.addColorStop(1, `hsl(${hue} 80% 24%)`);
+      grad.addColorStop(0.28, `hsl(${hue} 88% 66%)`);
+      grad.addColorStop(0.8, `hsl(${hue} 80% 42%)`);
+      grad.addColorStop(1, `hsl(${hue} 75% 24%)`);
       g.fillStyle = grad;
       g.beginPath();
       g.arc(size / 2, size / 2, r, 0, Math.PI * 2);
       g.fill();
-      g.fillStyle = "rgba(255,255,255,0.75)";
+      g.fillStyle = "rgba(255,255,255,0.72)";
       g.beginPath();
       g.ellipse(size * 0.37, size * 0.27, r * 0.28, r * 0.16, -0.5, 0, Math.PI * 2);
       g.fill();
       this.sprites.push(c);
+    }
+  }
+
+  // colors that depend only on the board, worked out once per board instead of every frame
+  private prepMap() {
+    const m = this.map!;
+    this.tint = MAPS.find((x) => x.id === m.id)?.hue ?? 210;
+    this.secStyle = m.sections.map((_, k) => ({
+      band: k % 2 ? "rgba(238,240,245,0.02)" : "rgba(0,0,0,0)",
+      name: "rgba(238,240,245,0.07)",
+      mini: k % 2 ? "rgba(238,240,245,0.1)" : "rgba(238,240,245,0.05)",
+    }));
+    const lists: number[][] = Array.from({ length: PALETTE_SIZE }, () => []);
+    this.opts!.roster.colorIdx.forEach((c, i) => lists[c].push(i));
+    this.byColor = lists.map((l) => Int32Array.from(l));
+  }
+
+  // canvas color strings, built once per (hue, saturation, lightness, alpha)
+  private style(h: number, sat: number, light: number, alpha = 1): string {
+    const a = Math.round(alpha * 100);
+    const key = ((h * 128 + sat) * 128 + light) * 128 + a;
+    let v = this.styles.get(key);
+    if (!v) { v = `hsla(${h} ${sat}% ${light}% / ${a / 100})`; this.styles.set(key, v); }
+    return v;
+  }
+
+  private buildAtlas() {
+    const o = this.opts!;
+    const names = o.roster.names, colors = o.roster.colorIdx, n = names.length;
+    const cell = Math.min(96, Math.ceil(this.R * 4 * this.dpr));
+    const key = `${cell}|${colors.join(",")}|${names.join("\u0001")}`;
+    if (key === this.atlasKey) return;
+    this.atlasKey = key;
+    const idx = new Map<string, number>();
+    const cells: { c: number; label: string }[] = [];
+    const slot = new Int32Array(n);
+    for (let i = 0; i < n; i++) {
+      const label = shortLabel(names[i]);
+      const k = `${colors[i]}|${label}`;
+      let c = idx.get(k);
+      if (c === undefined) { c = cells.length; idx.set(k, c); cells.push({ c: colors[i], label }); }
+      slot[i] = c;
+    }
+    const cols = Math.max(1, Math.ceil(Math.sqrt(cells.length)));
+    const cv = this.atlas ?? document.createElement("canvas");
+    cv.width = cols * cell;
+    cv.height = Math.max(1, Math.ceil(cells.length / cols)) * cell;
+    const g = cv.getContext("2d")!;
+    const r = cell / 2;
+    const font = (px: number) => `600 ${px.toFixed(1)}px ${FONT}`;
+    g.textAlign = "center";
+    g.textBaseline = "middle";
+    g.lineJoin = "round";
+    g.strokeStyle = "rgba(0,0,0,0.55)";
+    g.fillStyle = "#fff";
+    g.lineWidth = Math.max(1.5, r * 0.18);
+    cells.forEach(({ c, label }, k) => {
+      const x = (k % cols) * cell, y = Math.floor(k / cols) * cell;
+      g.drawImage(this.sprites[c], x, y, cell, cell);
+      let fs = r * 0.9;
+      g.font = font(fs);
+      const tw = g.measureText(label).width;
+      if (tw > r * 1.84) { fs *= (r * 1.84) / tw; g.font = font(fs); }
+      g.strokeText(label, x + r, y + r + 0.5);
+      g.fillText(label, x + r, y + r + 0.5);
+    });
+    this.atlas = cv;
+    this.atlasCell = cell;
+    this.atlasCols = cols;
+    this.atlasSlot = slot;
+    this.drawSig = "";
+    // web fonts arrive late: bake again once the glyphs are really there
+    const sample = cells.slice(0, 200).map((x) => x.label).join("");
+    const fonts = document.fonts;
+    if (sample && fonts && !fonts.check(font(16), sample)) {
+      void fonts.load(font(16), sample).then(() => {
+        if (this.atlasKey !== key) return;
+        this.atlasKey = "";
+        this.buildAtlas();
+      }, () => {});
     }
   }
 
@@ -301,12 +415,29 @@ export class Engine {
     c.width = c.height = 64;
     const g = c.getContext("2d")!;
     const grad = g.createRadialGradient(32, 32, 0, 32, 32, 32);
-    grad.addColorStop(0, `hsla(${key} 100% 75% / 0.9)`);
-    grad.addColorStop(0.35, `hsla(${key} 100% 60% / 0.35)`);
-    grad.addColorStop(1, `hsla(${key} 100% 50% / 0)`);
+    grad.addColorStop(0, `hsla(${key} 40% 88% / 0.7)`);
+    grad.addColorStop(0.35, `hsla(${key} 40% 75% / 0.22)`);
+    grad.addColorStop(1, `hsla(${key} 40% 60% / 0)`);
     g.fillStyle = grad;
     g.fillRect(0, 0, 64, 64);
     this.glows.set(key, c);
+    return c;
+  }
+
+  private bumper(hue: number): HTMLCanvasElement {
+    let c = this.bumperSprites.get(hue);
+    if (c) return c;
+    c = document.createElement("canvas");
+    c.width = c.height = 96;
+    const g = c.getContext("2d")!;
+    const r = 47;
+    const grad = g.createRadialGradient(48 - r * 0.3, 48 - r * 0.3, r * 0.1, 48, 48, r);
+    grad.addColorStop(0, `hsl(${hue} 18% 90%)`);
+    grad.addColorStop(0.55, `hsl(${hue} 12% 54%)`);
+    grad.addColorStop(1, `hsl(${hue} 14% 22%)`);
+    g.fillStyle = grad;
+    g.beginPath(); g.arc(48, 48, r, 0, Math.PI * 2); g.fill();
+    this.bumperSprites.set(hue, c);
     return c;
   }
 
@@ -368,13 +499,17 @@ export class Engine {
       if (this.hitstop > 0) this.hitstop -= rdt;
       else {
         this.acc += rdt * this.speed * this.slow;
+        // a slow device plays the race a little slower instead of dropping frames;
+        // the race itself is the same, since every step is the same fixed size
+        const t0 = performance.now();
         let steps = 0;
         while (this.acc >= DT && steps < 80) {
           w.step();
           this.acc -= DT;
           steps++;
+          if ((steps & 3) === 0 && performance.now() - t0 > 8) break;
         }
-        if (steps >= 80) this.acc = 0;
+        if (this.acc > DT * 4) this.acc = DT * 4;
       }
       this.consumeEvents();
       this.rank();
@@ -382,7 +517,11 @@ export class Engine {
     }
     this.updateParticles(rdt);
     this.updateCamera(rdt);
-    this.draw();
+    // a settled preview does not change, so it is not painted again
+    const idle = !w && this.shuffleT >= 1 && this.pn === 0 && this.flash < 0.01 && this.pops.length === 0 && this.shake === 0;
+    const sig = idle ? `${this.camX.toFixed(1)}|${this.camY.toFixed(1)}|${this.zoom.toFixed(3)}` : "";
+    if (!idle || sig !== this.drawSig) this.draw();
+    this.drawSig = sig;
     this.hudT -= rdt;
     if (this.hudT <= 0) this.emitHud(false);
   };
@@ -482,13 +621,13 @@ export class Engine {
       }
       if (!vis) continue;
       if (e.k === Ev.Bumper) {
-        this.spawn(e.x, e.y, 12, map.pegs[e.id].hue, 520);
+        this.spawn(e.x, e.y, 12, 42, 520);
         this.sound.boing(e.s);
       } else if (e.k === Ev.Peg) {
-        if (Math.random() < 0.35) this.spawn(e.x, e.y, 2, map.pegs[e.id].hue, 260, 0, 0.35);
+        if (Math.random() < 0.35) this.spawn(e.x, e.y, 2, 42, 260, 0, 0.35);
         this.sound.tick(e.x / map.W, e.s);
       } else if (e.k === Ev.Rotor) {
-        if (Math.random() < 0.3) this.spawn(e.x, e.y, 3, map.rotors[e.id].hue, 300, 0, 0.4);
+        if (Math.random() < 0.3) this.spawn(e.x, e.y, 3, 42, 300, 0, 0.4);
         if (Math.random() < 0.2) this.sound.thud();
       } else if (e.k === Ev.Seg) {
         if (Math.random() < 0.15) this.sound.tick(0.2, e.s * 0.5);
@@ -504,7 +643,7 @@ export class Engine {
         this.pops.push({ x: f.x, y: f.y - 30, text: "충격파", t: this.time, hue: 190 });
       } else if (f.k === "dash") {
         if (vis) this.sound.dash();
-        this.pops.push({ x: f.x, y: f.y - 30, text: `${shortLabel(this.nameOf(f.ball))} 대시!`, t: this.time, hue: 30 });
+        this.pops.push({ x: f.x, y: f.y - 30, text: `${shortLabel(this.nameOf(f.ball))} 대시`, t: this.time, hue: 30 });
       } else {
         if (vis) this.sound.gust();
         this.pops.push({ x: f.dir > 0 ? 700 : 300, y: f.y - f.r * 0.6, text: f.dir > 0 ? "돌풍 →" : "← 돌풍", t: this.time, hue: 160 });
@@ -560,125 +699,148 @@ export class Engine {
     else this.camX = Math.max(viewW / 2 - 20, Math.min(m.W - viewW / 2 + 20, this.camX));
     this.shake *= Math.exp(-rdt * 7);
     this.flash *= Math.exp(-rdt * 3);
+    if (this.shake < 0.05) this.shake = 0;
   }
 
   // ---------- drawing ----------
+  private drawStars() {
+    const g = this.ctx, cw = this.cw, ch = this.ch;
+    for (let l = 0; l < 3; l++) {
+      const z = STAR_Z[l] * 0.5;
+      g.fillStyle = STAR_STYLE[l];
+      g.beginPath();
+      for (const st of this.stars[l]) {
+        const yy = ((st.y * ch - this.camY * z) % ch + ch) % ch;
+        g.rect(st.x * cw, yy, st.s, st.s);
+      }
+      g.fill();
+    }
+  }
+
   private draw() {
     const g = this.ctx, dpr = this.dpr, cw = this.cw, ch = this.ch;
     g.setTransform(dpr, 0, 0, dpr, 0, 0);
     g.globalCompositeOperation = "source-over";
-    const bg = g.createLinearGradient(0, 0, 0, ch);
-    const m = this.map;
-    const prog = m ? Math.max(0, Math.min(1, this.camY / m.H)) : 0;
-    const h1 = 235 + prog * 60;
-    bg.addColorStop(0, `hsl(${h1} 55% 7%)`);
-    bg.addColorStop(1, `hsl(${h1 + 25} 60% 12%)`);
-    g.fillStyle = bg;
+    g.globalAlpha = 1;
+    g.fillStyle = BG;
     g.fillRect(0, 0, cw, ch);
-    // parallax stars
-    for (const s of this.stars) {
-      const yy = ((s.y * ch - this.camY * s.z * 0.5) % ch + ch) % ch;
-      const tw = 0.5 + 0.5 * Math.sin(this.time * (1 + s.z * 3) + s.x * 40);
-      g.fillStyle = `rgba(210,225,255,${0.25 + tw * 0.5 * s.z})`;
-      g.fillRect(s.x * cw, yy, s.s, s.s);
-    }
+    this.drawStars();
+    const m = this.map;
     if (!m) {
-      g.fillStyle = "rgba(255,255,255,0.4)";
-      g.font = "600 16px Pretendard, sans-serif";
+      g.fillStyle = "rgba(238,240,245,0.5)";
+      g.font = `500 15px ${FONT}`;
       g.textAlign = "center";
       g.fillText("참가자를 입력하면 구슬이 준비돼요", cw / 2, ch / 2);
       return;
     }
     const { s, viewH, usable } = this.view();
-    const shx = (Math.random() - 0.5) * this.shake, shy = (Math.random() - 0.5) * this.shake;
+    const shx = this.shake ? (Math.random() - 0.5) * this.shake : 0, shy = this.shake ? (Math.random() - 0.5) * this.shake : 0;
     const ox = usable / 2 - this.camX * s + shx, oy = ch / 2 - this.camY * s + shy;
-    g.setTransform(dpr * s, 0, 0, dpr * s, dpr * ox, dpr * oy);
+    const A = dpr * s, E = dpr * ox, F = dpr * oy;
+    g.setTransform(A, 0, 0, A, E, F);
     const top = this.camY - viewH / 2 - 60, bot = this.camY + viewH / 2 + 60;
     const w = this.world;
     const simT = w ? w.t : 0;
+    const TAU = Math.PI * 2;
 
     // section bands and names
-    for (const sec of m.sections) {
-      if (sec.y1 < top || sec.y0 > bot) continue;
-      const gr = g.createLinearGradient(0, sec.y0, 0, sec.y1);
-      gr.addColorStop(0, `hsla(${sec.hue} 80% 50% / 0.07)`);
-      gr.addColorStop(1, `hsla(${sec.hue} 80% 50% / 0.015)`);
-      g.fillStyle = gr;
+    g.font = `600 46px ${FONT}`;
+    g.textAlign = "right";
+    m.sections.forEach((sec, k) => {
+      if (sec.y1 < top || sec.y0 > bot) return;
+      const st = this.secStyle[k];
+      g.fillStyle = st.band;
       g.fillRect(0, sec.y0, m.W, sec.y1 - sec.y0);
-      g.fillStyle = `hsla(${sec.hue} 90% 75% / 0.16)`;
-      g.font = "800 46px Pretendard, sans-serif";
-      g.textAlign = "right";
+      g.fillStyle = st.name;
       g.fillText(sec.name, m.W - 24, sec.y0 + 56);
-    }
+    });
     // board rim
-    g.strokeStyle = "rgba(140,170,255,0.25)";
-    g.lineWidth = 3;
+    g.strokeStyle = "rgba(238,240,245,0.12)";
+    g.lineWidth = 2;
     g.strokeRect(-2, top, m.W + 4, bot - top);
 
     g.lineCap = "round";
-    // segments
-    for (let j = 0; j < m.segs.length; j++) {
-      const sg = m.segs[j];
-      if (Math.max(sg.y1, sg.y2) < top || Math.min(sg.y1, sg.y2) > bot) continue;
-      const lit = w ? Math.max(0, 1 - (simT - w.segHit[j]) * 4) : 0;
-      g.strokeStyle = `hsla(${sg.hue} 100% 60% / ${0.18 + lit * 0.3})`;
-      g.lineWidth = sg.t * 2 + 10;
-      g.beginPath(); g.moveTo(sg.x1, sg.y1); g.lineTo(sg.x2, sg.y2); g.stroke();
-      g.strokeStyle = `hsl(${sg.hue} 100% ${72 + lit * 20}%)`;
-      g.lineWidth = sg.t * 2;
-      g.beginPath(); g.moveTo(sg.x1, sg.y1); g.lineTo(sg.x2, sg.y2); g.stroke();
+    const T = this.tint;
+    // rails: all resting ones in one stroke per width, a hit one brightens on its own
+    {
+      let open = false;
+      g.strokeStyle = this.style(T, 14, 62);
+      for (let j = 0; j < m.segs.length; j++) {
+        const sg = m.segs[j];
+        if (Math.max(sg.y1, sg.y2) < top || Math.min(sg.y1, sg.y2) > bot) continue;
+        const lw = sg.t * 2;
+        if (!open || g.lineWidth !== lw) { if (open) g.stroke(); g.lineWidth = lw; g.beginPath(); open = true; }
+        g.moveTo(sg.x1, sg.y1); g.lineTo(sg.x2, sg.y2);
+      }
+      if (open) g.stroke();
+    }
+    if (w) {
+      for (let j = 0; j < m.segs.length; j++) {
+        const lit = 1 - (simT - w.segHit[j]) * 4;
+        if (lit <= 0) continue;
+        const sg = m.segs[j];
+        if (Math.max(sg.y1, sg.y2) < top || Math.min(sg.y1, sg.y2) > bot) continue;
+        g.strokeStyle = this.style(T, 20, 90, lit);
+        g.lineWidth = sg.t * 2;
+        g.beginPath(); g.moveTo(sg.x1, sg.y1); g.lineTo(sg.x2, sg.y2); g.stroke();
+      }
     }
     // gate
     if (!w || !w.gateOpen) {
       const gy = m.gateY;
-      const pulse = 0.6 + 0.4 * Math.sin(this.time * 6);
-      g.fillStyle = `rgba(255,210,90,${0.25 * pulse})`;
+      g.fillStyle = "rgba(242,193,78,0.12)";
       g.fillRect(0, gy - 16, m.W, 26);
-      g.strokeStyle = "#ffd76a";
+      g.strokeStyle = ACCENT;
       g.lineWidth = 8;
       g.beginPath(); g.moveTo(0, gy); g.lineTo(m.W, gy); g.stroke();
-      g.fillStyle = "rgba(40,20,0,0.85)";
+      g.fillStyle = "rgba(30,20,4,0.85)";
+      g.beginPath();
       for (let x = -40; x < m.W; x += 40) {
-        g.beginPath(); g.moveTo(x, gy - 4); g.lineTo(x + 18, gy - 4); g.lineTo(x + 26, gy + 4); g.lineTo(x + 8, gy + 4); g.fill();
+        g.moveTo(x, gy - 4); g.lineTo(x + 18, gy - 4); g.lineTo(x + 26, gy + 4); g.lineTo(x + 8, gy + 4); g.closePath();
       }
+      g.fill();
     } else if (simT - GATE_T < 0.6) {
       const e = (simT - GATE_T) / 0.6, gy = m.gateY;
-      g.strokeStyle = `rgba(255,215,106,${1 - e})`;
+      g.globalAlpha = 1 - e;
+      g.strokeStyle = ACCENT;
       g.lineWidth = 8;
       g.beginPath(); g.moveTo(0, gy); g.lineTo(m.W / 2 * (1 - e), gy); g.moveTo(m.W, gy); g.lineTo(m.W - m.W / 2 * (1 - e), gy); g.stroke();
+      g.globalAlpha = 1;
     }
 
-    // pegs and bumpers
-    g.globalCompositeOperation = "lighter";
+    // pins: one path; a pin that was just hit flares
+    g.fillStyle = this.style(T, 14, 72);
+    g.beginPath();
     for (let p = 0; p < m.pegs.length; p++) {
       const pg = m.pegs[p];
-      if (pg.y < top || pg.y > bot) continue;
-      const lit = w ? Math.max(0, 1 - (simT - w.pegHit[p]) * (pg.kick ? 3 : 5)) : 0;
-      const gs = pg.r * (pg.kick ? 3.2 : 5) * (1 + lit * 0.6);
-      g.globalAlpha = 0.35 + lit * 0.65;
-      g.drawImage(this.glow(pg.hue), pg.x - gs, pg.y - gs, gs * 2, gs * 2);
+      if (pg.kick || pg.y < top || pg.y > bot) continue;
+      g.moveTo(pg.x + pg.r, pg.y);
+      g.arc(pg.x, pg.y, pg.r, 0, TAU);
     }
-    g.globalAlpha = 1;
-    g.globalCompositeOperation = "source-over";
+    g.fill();
+    if (w) {
+      g.globalCompositeOperation = "lighter";
+      for (let p = 0; p < m.pegs.length; p++) {
+        const pg = m.pegs[p];
+        if (pg.y < top || pg.y > bot) continue;
+        const lit = 1 - (simT - w.pegHit[p]) * (pg.kick ? 3 : 5);
+        if (lit <= 0) continue;
+        const gs = pg.r * (pg.kick ? 3 : 4.5) * (1 + lit * 0.5);
+        g.globalAlpha = lit;
+        g.drawImage(this.glow(T), pg.x - gs, pg.y - gs, gs * 2, gs * 2);
+      }
+      g.globalAlpha = 1;
+      g.globalCompositeOperation = "source-over";
+    }
     for (let p = 0; p < m.pegs.length; p++) {
       const pg = m.pegs[p];
-      if (pg.y < top || pg.y > bot) continue;
+      if (!pg.kick || pg.y < top || pg.y > bot) continue;
       const lit = w ? Math.max(0, 1 - (simT - w.pegHit[p]) * 3) : 0;
-      if (pg.kick) {
-        const r = pg.r * (1 + lit * 0.18);
-        const gr = g.createRadialGradient(pg.x - r * 0.3, pg.y - r * 0.3, r * 0.1, pg.x, pg.y, r);
-        gr.addColorStop(0, `hsl(${pg.hue} 100% ${85 + lit * 10}%)`);
-        gr.addColorStop(0.6, `hsl(${pg.hue} 90% 52%)`);
-        gr.addColorStop(1, `hsl(${pg.hue} 90% 30%)`);
-        g.fillStyle = gr;
-        g.beginPath(); g.arc(pg.x, pg.y, r, 0, Math.PI * 2); g.fill();
-        g.strokeStyle = `hsla(${pg.hue} 100% 85% / ${0.6 + lit * 0.4})`;
-        g.lineWidth = 3;
-        g.beginPath(); g.arc(pg.x, pg.y, r + 5 + lit * 6, 0, Math.PI * 2); g.stroke();
-      } else {
-        g.fillStyle = `hsl(${pg.hue} 100% ${78 + lit * 20}%)`;
-        g.beginPath(); g.arc(pg.x, pg.y, pg.r, 0, Math.PI * 2); g.fill();
-      }
+      const r = pg.r * (1 + lit * 0.18);
+      g.drawImage(this.bumper(T), pg.x - r, pg.y - r, r * 2, r * 2);
+      g.strokeStyle = this.style(T, 16, 78, 0.35 + Math.round(lit * 5) / 10);
+      g.lineWidth = 3;
+      g.beginPath(); g.arc(pg.x, pg.y, r + 5 + lit * 6, 0, TAU); g.stroke();
     }
     // rotors
     for (let r = 0; r < m.rotors.length; r++) {
@@ -686,48 +848,38 @@ export class Engine {
       if (ro.cy + ro.len < top || ro.cy - ro.len > bot) continue;
       const ang = w ? w.rAng[r] : ro.a;
       const lit = w ? Math.max(0, 1 - (simT - w.rotorHit[r]) * 4) : 0;
-      const c = Math.cos(ang), sn = Math.sin(ang);
-      g.strokeStyle = `hsla(${ro.hue} 100% 60% / 0.12)`;
+      const c = Math.cos(ang), sn = Math.sin(ang), a = ro.arms;
+      g.strokeStyle = this.style(T, 14, 62, 0.08);
       g.lineWidth = 2;
-      g.beginPath(); g.arc(ro.cx, ro.cy, ro.len, 0, Math.PI * 2); g.stroke();
-      for (const pass of [0, 1]) {
-        g.strokeStyle = pass ? `hsl(${ro.hue} 100% ${74 + lit * 16}%)` : `hsla(${ro.hue} 100% 60% / ${0.22 + lit * 0.25})`;
-        g.lineWidth = pass ? ro.t * 2 : ro.t * 2 + 12;
-        g.beginPath();
-        for (let k = 0; k < ro.arms.length; k += 4) {
-          const a = ro.arms;
-          g.moveTo(ro.cx + a[k] * c - a[k + 1] * sn, ro.cy + a[k] * sn + a[k + 1] * c);
-          g.lineTo(ro.cx + a[k + 2] * c - a[k + 3] * sn, ro.cy + a[k + 2] * sn + a[k + 3] * c);
-        }
-        g.stroke();
+      g.beginPath(); g.arc(ro.cx, ro.cy, ro.len, 0, TAU); g.stroke();
+      g.beginPath();
+      for (let k = 0; k < a.length; k += 4) {
+        g.moveTo(ro.cx + a[k] * c - a[k + 1] * sn, ro.cy + a[k] * sn + a[k + 1] * c);
+        g.lineTo(ro.cx + a[k + 2] * c - a[k + 3] * sn, ro.cy + a[k + 2] * sn + a[k + 3] * c);
       }
-      g.fillStyle = `hsl(${ro.hue} 100% 85%)`;
-      g.beginPath(); g.arc(ro.cx, ro.cy, 12, 0, Math.PI * 2); g.fill();
-      g.fillStyle = `hsl(${ro.hue} 60% 25%)`;
-      g.beginPath(); g.arc(ro.cx, ro.cy, 5, 0, Math.PI * 2); g.fill();
+      g.strokeStyle = this.style(T, 16, 66 + Math.round(lit * 4) * 6);
+      g.lineWidth = ro.t * 2;
+      g.stroke();
+      g.fillStyle = this.style(T, 14, 84);
+      g.beginPath(); g.arc(ro.cx, ro.cy, 12, 0, TAU); g.fill();
+      g.fillStyle = this.style(T, 14, 20);
+      g.beginPath(); g.arc(ro.cx, ro.cy, 5, 0, TAU); g.fill();
     }
     // finish line
     if (m.goalY > top && m.goalY < bot + 200) {
-      const gy = m.goalY;
-      const sq = 20;
-      for (let x = 0, k = 0; x < m.W; x += sq, k++) {
-        g.fillStyle = k % 2 ? "rgba(255,255,255,0.85)" : "rgba(20,20,30,0.85)";
-        g.fillRect(x, gy - sq, sq, sq);
-        g.fillStyle = k % 2 ? "rgba(20,20,30,0.85)" : "rgba(255,255,255,0.85)";
-        g.fillRect(x, gy, sq, sq);
+      const gy = m.goalY, sq = 20;
+      for (let pass = 0; pass < 2; pass++) {
+        g.fillStyle = pass ? "rgba(238,240,245,0.85)" : "rgba(14,16,24,0.9)";
+        g.beginPath();
+        for (let x = 0, k = 0; x < m.W; x += sq, k++) {
+          g.rect(x, (k + pass) % 2 ? gy - sq : gy, sq, sq);
+        }
+        g.fill();
       }
-      g.globalCompositeOperation = "lighter";
-      const pulse = 0.5 + 0.5 * Math.sin(this.time * 4);
-      const gr = g.createLinearGradient(0, gy - 120, 0, gy + 20);
-      gr.addColorStop(0, "rgba(255,200,60,0)");
-      gr.addColorStop(1, `rgba(255,200,60,${0.25 + pulse * 0.2})`);
-      g.fillStyle = gr;
-      g.fillRect(0, gy - 120, m.W, 140);
-      g.globalCompositeOperation = "source-over";
-      g.fillStyle = "rgba(255,225,140,0.9)";
-      g.font = "900 40px Pretendard, sans-serif";
+      g.fillStyle = "rgba(242,193,78,0.85)";
+      g.font = `600 36px ${FONT}`;
       g.textAlign = "center";
-      g.fillText("FINISH", m.W / 2, gy + 80);
+      g.fillText("결승", m.W / 2, gy + 76);
     }
     // effects from the simulation
     if (w) for (const f of w.effects) {
@@ -735,17 +887,23 @@ export class Engine {
       if (age < 0 || age > f.dur) continue;
       const e = age / f.dur;
       if (f.k === "shock") {
-        g.strokeStyle = `rgba(120,230,255,${1 - e})`;
+        g.globalAlpha = 1 - e;
+        g.strokeStyle = "rgb(130,220,245)";
         g.lineWidth = 10 * (1 - e) + 2;
-        g.beginPath(); g.arc(f.x, f.y, f.r * (0.2 + e * 0.9), 0, Math.PI * 2); g.stroke();
+        g.beginPath(); g.arc(f.x, f.y, f.r * (0.2 + e * 0.9), 0, TAU); g.stroke();
+        g.globalAlpha = 1;
       } else if (f.k === "wind") {
-        g.strokeStyle = `rgba(160,255,220,${0.35 * Math.sin(e * Math.PI)})`;
+        g.globalAlpha = 0.35 * Math.sin(e * Math.PI);
+        g.strokeStyle = "rgb(170,240,215)";
         g.lineWidth = 3;
+        g.beginPath();
         for (let k = 0; k < 14; k++) {
           const yy = f.y - f.r + ((k * 97) % (f.r * 2));
           const xx = ((k * 211 + age * 900 * f.dir) % 1200 + 1200) % 1200 - 100;
-          g.beginPath(); g.moveTo(xx, yy); g.lineTo(xx - f.dir * 120, yy); g.stroke();
+          g.moveTo(xx, yy); g.lineTo(xx - f.dir * 120, yy);
         }
+        g.stroke();
+        g.globalAlpha = 1;
       }
     }
 
@@ -770,22 +928,20 @@ export class Engine {
       for (const [b, tr] of this.trails) {
         if (!tagged.has(b)) { this.trails.delete(b); continue; }
         if (tr.length < 4) continue;
-        const hue = paletteColor(roster.colorIdx[b]).hue;
-        g.lineCap = "round";
+        g.strokeStyle = this.style(Math.round(paletteColor(roster.colorIdx[b]).hue), 90, 70);
         for (let k = 2; k < tr.length; k += 2) {
           const a = k / tr.length;
-          g.strokeStyle = `hsla(${hue} 100% 70% / ${a * 0.55})`;
+          g.globalAlpha = a * 0.4;
           g.lineWidth = R * 1.6 * a;
           g.beginPath(); g.moveTo(tr[k - 2], tr[k - 1]); g.lineTo(tr[k], tr[k + 1]); g.stroke();
         }
       }
+      g.globalAlpha = 1;
     }
     const ease = this.shuffleEase();
-    const showLabel = R * s >= 8.5;
-    g.font = `800 ${R * (showLabel && R * s > 14 ? 0.82 : 0.95)}px Pretendard, sans-serif`;
-    g.textAlign = "center";
-    g.textBaseline = "middle";
-    const labels: number[] = [];
+    const atlas = R * s >= 8.5 ? this.atlas : null;
+    const cell = this.atlasCell, cols = this.atlasCols, slot = this.atlasSlot;
+    const D = R * 2;
     for (let i = 0; i < n; i++) {
       let bx: number, by: number;
       if (w) {
@@ -799,107 +955,123 @@ export class Engine {
         g.drawImage(this.glow(30), bx - gs, by - gs, gs * 2, gs * 2);
         g.globalCompositeOperation = "source-over";
       }
-      g.drawImage(this.sprites[roster.colorIdx[i]], bx - R, by - R, R * 2, R * 2);
-      if (showLabel) labels.push(i, bx, by);
+      if (atlas) {
+        const k = slot[i];
+        g.drawImage(atlas, (k % cols) * cell, Math.floor(k / cols) * cell, cell, cell, bx - R, by - R, D, D);
+      } else g.drawImage(this.sprites[roster.colorIdx[i]], bx - R, by - R, D, D);
     }
-    if (labels.length) {
-      g.lineWidth = Math.max(1.5, R * 0.18);
-      g.strokeStyle = "rgba(0,0,0,0.55)";
-      g.fillStyle = "#fff";
-      for (let k = 0; k < labels.length; k += 3) {
-        const t = shortLabel(roster.names[labels[k]]);
-        g.strokeText(t, labels[k + 1], labels[k + 2] + 0.5);
-        g.fillText(t, labels[k + 1], labels[k + 2] + 0.5);
-      }
-    }
-    g.textBaseline = "alphabetic";
     // name tags for the leaders and the ball the camera is following
     if (w && this.phase !== "countdown") {
       const fs = Math.max(13, 15 / s);
-      g.font = `800 ${fs}px Pretendard, sans-serif`;
+      g.font = `600 ${fs}px ${FONT}`;
+      g.textAlign = "center";
       const placed: number[] = [];
       const ordered = [...tagged].sort((a, b) => (a === target ? -1 : b === target ? 1 : 0));
       for (const b of ordered) {
         if (w.done[b]) continue;
         const bx = w.x[b], by = w.y[b];
         if (by < top || by > bot) continue;
-        const rk = this.liveRank(b);
-        const label = `${rk}위 ${this.nameOf(b)}`;
+        const label = `${this.liveRank(b)}위 ${this.nameOf(b)}`;
         const tw = g.measureText(label).width + fs;
-        const hue = paletteColor(roster.colorIdx[b]).hue;
         const isT = b === target;
-        g.fillStyle = isT ? "rgba(255,214,90,0.95)" : `hsla(${hue} 80% 18% / 0.85)`;
         const yy = by - R - fs * 1.5;
         let clash = false;
-        for (let k = 0; k < placed.length; k += 4) {
+        for (let k = 0; k < placed.length; k += 3) {
           if (Math.abs(placed[k] - bx) < (placed[k + 2] + tw) / 2 && Math.abs(placed[k + 1] - yy) < fs * 1.5) clash = true;
         }
         if (clash) continue;
-        placed.push(bx, yy, tw, 0);
-        roundRect(g, bx - tw / 2, yy - fs * 0.85, tw, fs * 1.4, fs * 0.7);
+        placed.push(bx, yy, tw);
+        g.fillStyle = isT ? ACCENT : "rgba(12,14,22,0.88)";
+        roundRect(g, bx - tw / 2, yy - fs * 0.85, tw, fs * 1.4, fs * 0.35);
         g.fill();
-        g.fillStyle = isT ? "#2a1800" : "#fff";
-        g.textAlign = "center";
+        g.fillStyle = isT ? "#1c1503" : "#eef0f5";
         g.fillText(label, bx, yy + fs * 0.2);
         if (isT) {
-          g.strokeStyle = "rgba(255,214,90,0.9)";
-          g.lineWidth = 2.5 / s * 1.2;
-          const rr = R + 6 + Math.sin(this.time * 8) * 2;
-          g.beginPath(); g.arc(bx, by, rr, 0, Math.PI * 2); g.stroke();
+          g.strokeStyle = ACCENT;
+          g.lineWidth = 3 / s;
+          g.beginPath(); g.arc(bx, by, R + 6, 0, TAU); g.stroke();
         }
       }
     }
-    // particles
-    g.globalCompositeOperation = "lighter";
-    for (let i = 0; i < this.pn; i++) {
-      if (this.pkind[i] === 1) continue;
-      const a = this.plife[i] / this.pmax[i];
-      g.strokeStyle = `hsla(${this.phue[i]} 100% 65% / ${a})`;
-      g.lineWidth = 3 * a + 1;
-      g.beginPath();
-      g.moveTo(this.px[i], this.py[i]);
-      g.lineTo(this.px[i] - this.pvx[i] * 0.03, this.py[i] - this.pvy[i] * 0.03);
-      g.stroke();
-    }
-    g.globalCompositeOperation = "source-over";
-    for (let i = 0; i < this.pn; i++) {
-      if (this.pkind[i] !== 1) continue;
-      const a = Math.min(1, this.plife[i] / this.pmax[i] * 2);
-      g.save();
-      g.translate(this.px[i], this.py[i]);
-      g.rotate(this.prot[i]);
-      g.scale(1, Math.cos(this.prot[i] * 1.7));
-      g.fillStyle = `hsla(${this.phue[i]} 95% 62% / ${a})`;
-      g.fillRect(-7, -4, 14, 8);
-      g.restore();
+    // sparks, sorted into color buckets so each bucket is one stroke
+    if (this.pn) {
+      const cnt = this.sparkCount, ord = this.sparkOrder;
+      cnt.fill(0);
+      const keyOf = (i: number) => {
+        const hb = Math.floor((((this.phue[i] % 360) + 360) % 360) / (360 / SPARK_HUES)) % SPARK_HUES;
+        const ab = Math.min(SPARK_ALPHAS - 1, Math.floor((this.plife[i] / this.pmax[i]) * SPARK_ALPHAS));
+        return hb * SPARK_ALPHAS + ab;
+      };
+      for (let i = 0; i < this.pn; i++) if (this.pkind[i] !== 1) cnt[keyOf(i) + 1]++;
+      for (let k = 0; k < SPARK_KEYS; k++) cnt[k + 1] += cnt[k];
+      const end = cnt[SPARK_KEYS];
+      const pos = cnt.slice(0, SPARK_KEYS);
+      for (let i = 0; i < this.pn; i++) if (this.pkind[i] !== 1) ord[pos[keyOf(i)]++] = i;
+      g.globalCompositeOperation = "lighter";
+      for (let k = 0, q = 0; k < SPARK_KEYS && q < end; k++) {
+        const stop = cnt[k + 1];
+        if (q === stop) continue;
+        g.strokeStyle = SPARK_STYLE[k];
+        g.lineWidth = 3 * (((k % SPARK_ALPHAS) + 0.5) / SPARK_ALPHAS) + 1;
+        g.beginPath();
+        for (; q < stop; q++) {
+          const i = ord[q];
+          g.moveTo(this.px[i], this.py[i]);
+          g.lineTo(this.px[i] - this.pvx[i] * 0.03, this.py[i] - this.pvy[i] * 0.03);
+        }
+        g.stroke();
+      }
+      g.globalCompositeOperation = "source-over";
+      // confetti: one transform per piece, no save/restore
+      for (let i = 0; i < this.pn; i++) {
+        if (this.pkind[i] !== 1) continue;
+        const rot = this.prot[i], c = Math.cos(rot), sn = Math.sin(rot), k = Math.cos(rot * 1.7);
+        g.setTransform(A * c, A * sn, -A * sn * k, A * c * k, E + A * this.px[i], F + A * this.py[i]);
+        g.globalAlpha = Math.min(1, (this.plife[i] / this.pmax[i]) * 2);
+        g.fillStyle = CONFETTI_STYLE[Math.floor((((this.phue[i] % 360) + 360) % 360) / 30) % 12];
+        g.fillRect(-7, -4, 14, 8);
+      }
+      g.globalAlpha = 1;
+      g.setTransform(A, 0, 0, A, E, F);
     }
     // floating callouts
-    g.textAlign = "center";
-    this.pops = this.pops.filter((p) => this.time - p.t < 1.6);
-    for (const p of this.pops) {
-      const age = this.time - p.t;
-      const a = Math.min(1, (1.6 - age) * 2);
+    if (this.pops.length) {
+      g.textAlign = "center";
+      g.lineJoin = "round";
+      this.pops = this.pops.filter((p) => this.time - p.t < 1.6);
       const fs = Math.max(20, 22 / s);
-      g.font = `900 ${fs}px Pretendard, sans-serif`;
+      g.font = `600 ${fs}px ${FONT}`;
       g.lineWidth = fs * 0.22;
-      g.strokeStyle = `rgba(0,0,0,${a * 0.6})`;
-      g.fillStyle = `hsla(${p.hue} 100% 70% / ${a})`;
-      g.strokeText(p.text, p.x, p.y - age * 50);
-      g.fillText(p.text, p.x, p.y - age * 50);
+      for (const p of this.pops) {
+        const age = this.time - p.t;
+        g.globalAlpha = Math.min(1, (1.6 - age) * 2);
+        g.strokeStyle = "rgba(0,0,0,0.6)";
+        g.fillStyle = p.hue === 50 ? ACCENT : "#eef0f5";
+        g.strokeText(p.text, p.x, p.y - age * 50);
+        g.fillText(p.text, p.x, p.y - age * 50);
+      }
+      g.globalAlpha = 1;
     }
 
     // screen space: flash, vignette, minimap
     g.setTransform(dpr, 0, 0, dpr, 0, 0);
     if (this.flash > 0.01) {
-      g.fillStyle = `rgba(255,240,200,${this.flash * 0.45})`;
+      g.globalAlpha = this.flash * 0.4;
+      g.fillStyle = "rgb(255,240,205)";
       g.fillRect(0, 0, cw, ch);
+      g.globalAlpha = 1;
     }
     if (this.slow < 0.9) {
-      const v = g.createRadialGradient(usable / 2, ch / 2, Math.min(usable, ch) * 0.3, usable / 2, ch / 2, Math.max(usable, ch) * 0.75);
-      v.addColorStop(0, "rgba(0,0,0,0)");
-      v.addColorStop(1, `rgba(40,0,10,${(1 - this.slow) * 0.7})`);
-      g.fillStyle = v;
+      if (!this.vignette) {
+        const v = g.createRadialGradient(usable / 2, ch / 2, Math.min(usable, ch) * 0.3, usable / 2, ch / 2, Math.max(usable, ch) * 0.75);
+        v.addColorStop(0, "rgba(0,0,0,0)");
+        v.addColorStop(1, "rgba(30,4,10,0.7)");
+        this.vignette = v;
+      }
+      g.globalAlpha = Math.min(1, 1 - this.slow);
+      g.fillStyle = this.vignette;
       g.fillRect(0, 0, cw, ch);
+      g.globalAlpha = 1;
     }
     this.drawMinimap(viewH);
   }
@@ -922,33 +1094,39 @@ export class Engine {
     const r = this.miniRect();
     const sy = r.h / (m.H + 400), sx = r.w / m.W;
     const Y = (y: number) => r.y + (y + 400) * sy;
-    g.fillStyle = "rgba(8,10,30,0.7)";
-    roundRect(g, r.x - 3, r.y - 3, r.w + 6, r.h + 6, 10);
+    g.fillStyle = "rgba(7,8,13,0.82)";
+    roundRect(g, r.x - 4, r.y - 4, r.w + 8, r.h + 8, 8);
     g.fill();
-    for (const sec of m.sections) {
-      g.fillStyle = `hsla(${sec.hue} 80% 55% / 0.16)`;
+    m.sections.forEach((sec, k) => {
+      g.fillStyle = this.secStyle[k].mini;
       g.fillRect(r.x, Y(sec.y0), r.w, Math.max(1, (sec.y1 - sec.y0) * sy - 1));
-    }
-    g.fillStyle = "#ffd76a";
+    });
+    g.fillStyle = ACCENT;
     g.fillRect(r.x, Y(m.goalY) - 1, r.w, 2);
     const w = this.world;
-    const n = this.slotOf.length;
-    const roster = this.opts!.roster;
-    const sz = n > 400 ? 1.5 : 2.5;
-    for (let i = 0; i < n; i++) {
-      let bx: number, by: number;
-      if (w) { if (w.done[i]) continue; bx = w.x[i]; by = w.y[i]; }
-      else { bx = m.slots[this.slotOf[i] * 2]; by = m.slots[this.slotOf[i] * 2 + 1]; }
-      g.fillStyle = paletteColor(roster.colorIdx[i]).css;
-      g.fillRect(r.x + bx * sx - sz / 2, Y(by) - sz / 2, sz, sz);
+    const sz = this.slotOf.length > 400 ? 1.5 : 2.5, hs = sz / 2;
+    // one path per color: 48 fills instead of a style change per ball
+    for (let c = 0; c < this.byColor.length; c++) {
+      const list = this.byColor[c];
+      if (!list.length) continue;
+      g.beginPath();
+      for (let q = 0; q < list.length; q++) {
+        const i = list[q];
+        let bx: number, by: number;
+        if (w) { if (w.done[i]) continue; bx = w.x[i]; by = w.y[i]; }
+        else { const sl = this.slotOf[i] * 2; bx = m.slots[sl]; by = m.slots[sl + 1]; }
+        g.rect(r.x + bx * sx - hs, Y(by) - hs, sz, sz);
+      }
+      g.fillStyle = paletteColor(c).css;
+      g.fill();
     }
     const t = this.nextTarget();
     if (w && t !== null) {
-      g.strokeStyle = "#ffd76a";
+      g.strokeStyle = ACCENT;
       g.lineWidth = 1.5;
       g.beginPath(); g.arc(r.x + w.x[t] * sx, Y(w.y[t]), 4, 0, Math.PI * 2); g.stroke();
     }
-    g.strokeStyle = "rgba(255,255,255,0.7)";
+    g.strokeStyle = "rgba(238,240,245,0.6)";
     g.lineWidth = 1;
     g.strokeRect(r.x - 1, Y(this.camY - viewH / 2), r.w + 2, viewH * sy);
   }

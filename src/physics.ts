@@ -35,6 +35,9 @@ export class World {
   private wind: Effect | null = null;
   // static broadphase
   private sCols: number; private sRows: number; private sCells: Int32Array[];
+  // rotors near each static cell, in rotor order, so a ball only tests the windmills it can reach
+  private rCells: Int32Array[];
+  private allRotors: Int32Array;
   // ball broadphase
   private bCell: number; private bCols: number; private bRows: number;
   private head: Int32Array; private nxt: Int32Array; private cellOf: Int32Array;
@@ -85,6 +88,16 @@ export class World {
       add(-(j + 1), Math.min(s.x1, s.x2) - s.t, Math.min(s.y1, s.y2) - s.t, Math.max(s.x1, s.x2) + s.t, Math.max(s.y1, s.y2) + s.t);
     });
     for (let k = 0; k < tmp.length; k++) this.sCells.push(Int32Array.from(tmp[k]));
+    const rtmp: number[][] = Array.from({ length: this.sCols * this.sRows }, () => []);
+    map.rotors.forEach((ro, r) => {
+      const lim = ro.len + R + ro.t + 1;
+      const c0 = Math.max(0, Math.floor((ro.cx - lim) / SCELL)), c1 = Math.min(this.sCols - 1, Math.floor((ro.cx + lim) / SCELL));
+      const r0 = Math.max(0, Math.floor((ro.cy - lim) / SCELL)), r1 = Math.min(this.sRows - 1, Math.floor((ro.cy + lim) / SCELL));
+      for (let y = r0; y <= r1; y++) for (let x = c0; x <= c1; x++) rtmp[y * this.sCols + x].push(r);
+    });
+    const empty = new Int32Array(0);
+    this.rCells = rtmp.map((a) => (a.length ? Int32Array.from(a) : empty));
+    this.allRotors = Int32Array.from(map.rotors.map((_, r) => r));
 
     this.bCell = 2 * R + 0.5;
     this.bCols = Math.ceil(map.W / this.bCell) + 2;
@@ -147,7 +160,11 @@ export class World {
           if (vy[i] > 0) vy[i] = -vy[i] * g.e;
         }
       }
-      for (let r = 0; r < map.rotors.length; r++) {
+      // the ball may have moved while resolving statics, so look its cell up again
+      const rc = Math.floor(x[i] / SCELL), rr = Math.floor(y[i] / SCELL);
+      const near = rc >= 0 && rc < this.sCols && rr >= 0 && rr < this.sRows ? this.rCells[rr * this.sCols + rc] : this.allRotors;
+      for (let q = 0; q < near.length; q++) {
+        const r = near[q];
         const ro = map.rotors[r];
         const dx = x[i] - ro.cx, dy = y[i] - ro.cy, lim = ro.len + R + ro.t;
         if (dx * dx + dy * dy > lim * lim) continue;
@@ -286,34 +303,38 @@ export class World {
       nxt[i] = head[cell];
       head[cell] = i;
     }
-    const D = 2 * this.R, D2 = D * D;
-    const pair = (i: number, j: number) => {
-      let dx = x[j] - x[i], dy = y[j] - y[i];
-      let d2 = dx * dx + dy * dy;
-      if (d2 >= D2) return;
-      if (d2 < 1e-8) { dx = (((i * 7 + j) % 5) - 2) * 0.01 + 0.005; dy = 0.01; d2 = dx * dx + dy * dy; }
-      const d = Math.sqrt(d2), nx = dx / d, ny = dy / d;
-      const corr = (D - d) * 0.5;
-      x[i] -= nx * corr; y[i] -= ny * corr;
-      x[j] += nx * corr; y[j] += ny * corr;
-      const rvn = (vx[j] - vx[i]) * nx + (vy[j] - vy[i]) * ny;
-      if (rvn < 0) {
-        const imp = -(1 + E_BALL) * rvn * 0.5;
-        vx[i] -= imp * nx; vy[i] -= imp * ny;
-        vx[j] += imp * nx; vy[j] += imp * ny;
-      }
-    };
+    const D = 2 * this.R, D2 = D * D, total = cols * rows;
+    // pairs in a fixed order (own cell, then right, lower-left, lower, lower-right) keep the race reproducible
     for (let i = 0; i < n; i++) {
       const cell = cellOf[i];
       if (cell < 0) continue;
-      for (let j = nxt[i]; j !== -1; j = nxt[j]) pair(i, j);
       const c = cell % cols;
-      for (let q = 0; q < 4; q++) {
-        const nc = q === 0 ? cell + 1 : cell + cols - 2 + q;
-        if ((q === 0 || q === 3) && c === cols - 1) continue;
-        if (q === 1 && c === 0) continue;
-        if (nc >= cols * rows) continue;
-        for (let j = head[nc]; j !== -1; j = nxt[j]) pair(i, j);
+      for (let q = -1; q < 4; q++) {
+        let j: number;
+        if (q < 0) j = nxt[i];
+        else {
+          const nc = q === 0 ? cell + 1 : cell + cols - 2 + q;
+          if ((q === 0 || q === 3) && c === cols - 1) continue;
+          if (q === 1 && c === 0) continue;
+          if (nc >= total) continue;
+          j = head[nc];
+        }
+        for (; j !== -1; j = nxt[j]) {
+          let dx = x[j] - x[i], dy = y[j] - y[i];
+          let d2 = dx * dx + dy * dy;
+          if (d2 >= D2) continue;
+          if (d2 < 1e-8) { dx = (((i * 7 + j) % 5) - 2) * 0.01 + 0.005; dy = 0.01; d2 = dx * dx + dy * dy; }
+          const d = Math.sqrt(d2), nx = dx / d, ny = dy / d;
+          const corr = (D - d) * 0.5;
+          x[i] -= nx * corr; y[i] -= ny * corr;
+          x[j] += nx * corr; y[j] += ny * corr;
+          const rvn = (vx[j] - vx[i]) * nx + (vy[j] - vy[i]) * ny;
+          if (rvn < 0) {
+            const imp = -(1 + E_BALL) * rvn * 0.5;
+            vx[i] -= imp * nx; vy[i] -= imp * ny;
+            vx[j] += imp * nx; vy[j] += imp * ny;
+          }
+        }
       }
     }
   }

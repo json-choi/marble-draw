@@ -24,5 +24,5 @@ pnpm install
 pnpm dev                 # http://localhost:5180
 pnpm typecheck
 node scripts/shot.mjs http://localhost:5180/ /tmp/draw-shots 1000   # headless 1000개 레이스 스크린샷
-pnpm run deploy          # 빌드 후 Cloudflare 배포 (Worker marble-draw)
+pnpm run deploy          # 빌드 후 Cloudflare 배포 (Worker marble-draw, https://marble.js-studio.dev)
 ```
