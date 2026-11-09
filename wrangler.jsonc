@@ -1,0 +1,10 @@
+{
+  // Static assets only: no Worker script runs, so requests are free on the Workers Free plan.
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "marble-draw",
+  "compatibility_date": "2026-11-01",
+  "assets": {
+    "directory": "./dist",
+    "not_found_handling": "single-page-application"
+  }
+}
